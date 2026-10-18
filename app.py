@@ -1,5 +1,7 @@
+
 import re
 import time
+from io import BytesIO
 from urllib.parse import urlparse, urljoin
 
 import pandas as pd
@@ -7,182 +9,358 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from io import BytesIO
 
 st.set_page_config(page_title="Fresh Lead Finder", page_icon="🔎", layout="wide")
 st.title("🔎 Fresh Lead Finder")
-st.write("Find candidate company websites, check public contact details, and export an Excel workbook.")
+st.write("Find company websites, check their own contact pages, and export Excel.")
 
-st.info("This first web version uses public web search to discover candidate sites. It does not directly scrape Google Maps. Search results may include directories; review the source URLs. It does not bypass CAPTCHAs, logins, paywalls, or rate limits.")
+st.info(
+    "Blogs, directories and listicles are filtered where identifiable. "
+    "Contact details are collected from the candidate company's website only. "
+    "Please review source URLs because automated verification is not perfect."
+)
 
-with st.form("search_form"):
-    query = st.text_input("Business / industry query", placeholder="e.g. Real estate agencies")
-    area = st.text_input("Country / city / area (optional)", placeholder="e.g. Karachi, Pakistan")
-    target = st.select_slider("Companies to find", options=[10, 20, 50, 100], value=100)
-    submitted = st.form_submit_button("Start search and website research", type="primary")
+BLOCKED_DOMAINS = {
+    "google.com", "facebook.com", "instagram.com", "linkedin.com",
+    "youtube.com", "wikipedia.org", "yelp.com", "yellowpages.com",
+    "businesslist.pk", "zameen.com", "ensun.io", "crunchbase.com",
+    "zoominfo.com", "clutch.co", "justdial.com", "kompass.com",
+    "medium.com", "blogspot.com", "wordpress.com", "substack.com",
+    "pinterest.com", "mapquest.com", "foursquare.com", "hotfrog.com",
+    "cybo.com", "reddit.com", "tripadvisor.com"
+}
 
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-UA = {"User-Agent": "Mozilla/5.0 (compatible; FreshLeadFinder/1.0; public business research)"}
-BLOCKED_DOMAINS = ("google.com", "google.co.", "maps.google.", "youtube.com", "facebook.com",
-                   "instagram.com", "linkedin.com", "wikipedia.org", "ensun.io", "yelp.com",
-                   "yellowpages.", "tripadvisor.")
+BAD_WORDS = (
+    "top 10", "top 20", "top 11", "best companies", "best agencies",
+    "list of", "directory", "directories", "business listing",
+    "company listing", "companies in", "blog", "guide to", "ranking"
+)
 
-def root_url(raw):
-    if not raw:
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+    )
+}
+
+EMAIL_RE = re.compile(
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I
+)
+
+
+def get_host(url):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0]
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
         return ""
-    if not raw.startswith(("http://", "https://")):
-        raw = "https://" + raw
-    p = urlparse(raw)
-    return f"{p.scheme}://{p.netloc}/" if p.netloc else ""
 
-def discover(q, location, target, log):
-    base = " ".join(x.strip() for x in [q, location] if x and x.strip())
-    queries = [base, base + " official website", base + " contact", base + " companies"]
-    found, seen = [], set()
-    with DDGS() as ddgs:
-        for search_q in queries:
-            if len(found) >= target:
-                break
-            log(f"Searching: {search_q}")
+
+def blocked_domain(host):
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in BLOCKED_DOMAINS
+    )
+
+
+def root_url(url):
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    host = get_host(url)
+    return "https://" + host + "/" if host else ""
+
+
+def fetch(url):
+    try:
+        response = requests.get(
+            url, headers=HEADERS, timeout=10, allow_redirects=True
+        )
+        if response.status_code >= 400:
+            return "", response.url
+        if "html" not in response.headers.get("Content-Type", "").lower():
+            return "", response.url
+        return response.text[:1500000], response.url
+    except requests.RequestException:
+        return "", url
+
+
+def visible_text(soup):
+    return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+
+
+def is_list_page(title, snippet, url):
+    text = f"{title} {snippet} {url}".lower()
+    return any(word in text for word in BAD_WORDS)
+
+
+def get_contacts(html):
+    soup = BeautifulSoup(html, "html.parser")
+    emails = set()
+    phones = set()
+
+    for link in soup.select('a[href^="mailto:"]'):
+        value = link.get("href", "").split(":", 1)[1].split("?")[0].strip()
+        if EMAIL_RE.fullmatch(value):
+            emails.add(value.lower())
+
+    for link in soup.select('a[href^="tel:"]'):
+        value = link.get("href", "").split(":", 1)[1].strip()
+        if len(re.sub(r"\D", "", value)) >= 7:
+            phones.add(value)
+
+    text = visible_text(soup)
+
+    for email in EMAIL_RE.findall(text):
+        if "example.com" not in email.lower():
+            emails.add(email.lower())
+
+    phone_pattern = r"(?<!\w)\+?\d[\d\s()./-]{6,}\d(?!\w)"
+    for phone in re.findall(phone_pattern, text):
+        digits = re.sub(r"\D", "", phone)
+        if 7 <= len(digits) <= 16:
+            phones.add(re.sub(r"\s+", " ", phone).strip())
+
+    return sorted(emails), sorted(phones), soup
+
+
+def discover(query, area, target, log):
+    found = {}
+
+    searches = [
+        f'"{query}" official website {area}',
+        f'{query} companies {area} contact us',
+        f'{query} company website {area}',
+        f'{query} business official contact {area}',
+    ]
+
+    with DDGS() as searcher:
+        for search_query in searches:
+            log.write(f"Searching: {search_query}")
             try:
-                for result in ddgs.text(search_q, max_results=min(50, target)):
-                    raw = result.get("href") or result.get("url") or ""
-                    site = root_url(raw)
-                    if not site or any(x in urlparse(site).netloc.lower() for x in BLOCKED_DOMAINS):
+                results = searcher.text(search_query, max_results=30)
+
+                for result in results:
+                    title = result.get("title", "")
+                    url = result.get("href", "") or result.get("url", "")
+                    snippet = result.get("body", "") or result.get("snippet", "")
+
+                    if not url.startswith(("http://", "https://")):
                         continue
-                    host = urlparse(site).netloc.lower().replace("www.", "")
-                    title = (result.get("title") or "").strip()
-                    if not title or host in seen:
+
+                    host = get_host(url)
+
+                    if not host or blocked_domain(host):
                         continue
-                    seen.add(host)
-                    name = re.split(r"\s[|–-]\s", title)[0].strip()[:160]
-                    found.append({
-                        "Business Name": name,
-                        "Website": site,
-                        "Phone": "",
-                        "Email": "",
-                        "Business Description": (result.get("body") or "")[:500],
-                        "Source URL": raw,
-                        "Status": "Discovered; research pending"
+
+                    if is_list_page(title, snippet, url):
+                        continue
+
+                    found.setdefault(host, {
+                        "title": title,
+                        "url": root_url(url)
                     })
-                    log(f"Discovered {len(found)}/{target}: {name}")
-                    if len(found) >= target:
+
+                    if len(found) >= target * 3:
                         break
+
             except Exception as exc:
-                log(f"Search provider limit/error: {str(exc)[:180]}")
-                time.sleep(1)
-    return found
+                log.write(
+                    f"Search issue: {type(exc).__name__}. "
+                    "Continuing without bypassing limits."
+                )
 
-def contact_links(soup, base):
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
-        label = (a.get_text(" ", strip=True) + " " + href).lower()
-        if any(k in label for k in ("contact", "about", "get-in-touch", "reach-us")):
-            full = urljoin(base, href)
-            if urlparse(full).netloc == urlparse(base).netloc and full not in out:
-                out.append(full)
-    return out[:4]
+            time.sleep(0.5)
 
-def research(row, log):
-    emails, phones, visited, queue = set(), set(), set(), [row["Website"]]
-    description = row.get("Business Description", "")
-    checked = 0
-    while queue and checked < 5:
-        url = queue.pop(0)
-        if url in visited:
+    return list(found.values())
+
+
+def research_site(candidate, query, area):
+    html, final_url = fetch(candidate["url"])
+
+    if not html:
+        return None
+
+    host = get_host(final_url)
+    if not host or blocked_domain(host):
+        return None
+
+    emails, phones, soup = get_contacts(html)
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    page_text = visible_text(soup)
+
+    if is_list_page(title, page_text[:2000], final_url):
+        return None
+
+    if any(word in host for word in (
+        "blog", "directory", "directories", "yellowpages", "businesslist"
+    )):
+        return None
+
+    site_name = soup.find("meta", attrs={"property": "og:site_name"})
+    name = site_name.get("content", "").strip() if site_name else ""
+
+    if not name:
+        name = re.split(r"\s+[|–—-]\s+", title)[0].strip()
+
+    if not name or len(name) < 2:
+        name = host.split(".")[0].replace("-", " ").title()
+
+    description = ""
+    meta = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    if meta:
+        description = meta.get("content", "").strip()
+
+    # Find contact/about pages linked from the company's own website.
+    pages = []
+    for link in soup.find_all("a", href=True):
+        href = urljoin(final_url, link["href"])
+        label = (link.get_text(" ", strip=True) + " " + href).lower()
+
+        if (
+            get_host(href) == host
+            and any(word in label for word in (
+                "contact", "about", "reach us", "get in touch", "imprint"
+            ))
+            and href.startswith(("http://", "https://"))
+        ):
+            if href not in pages:
+                pages.append(href)
+
+    for path in ("/contact", "/contact-us", "/about", "/about-us"):
+        pages.append(urljoin(final_url, path))
+
+    visited = set()
+
+    for page_url in pages[:10]:
+        if page_url in visited or get_host(page_url) != host:
             continue
-        visited.add(url)
-        try:
-            response = requests.get(url, headers=UA, timeout=12, allow_redirects=True)
-            if response.status_code >= 400 or "html" not in response.headers.get("content-type", "").lower():
-                continue
-            soup = BeautifulSoup(response.text, "html.parser")
-            text = soup.get_text(" ", strip=True)
-            checked += 1
-            if not description:
-                meta = soup.find("meta", attrs={"name": re.compile("description", re.I)})
-                description = (meta.get("content", "") if meta else "") or text[:350]
-            emails.update(e.lower().strip(".,;:()[]<>") for e in EMAIL_RE.findall(response.text))
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if href.lower().startswith("mailto:"):
-                    email = href.split(":", 1)[1].split("?", 1)[0].strip().lower()
-                    if EMAIL_RE.fullmatch(email):
-                        emails.add(email)
-                if href.lower().startswith("tel:"):
-                    phone = href.split(":", 1)[1].split("?", 1)[0].strip()
-                    if 8 <= len(re.sub(r"\D", "", phone)) <= 15:
-                        phones.add(phone)
-            for phone in re.findall(r"(?:\+\d{1,3}[\s().-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d[\d\s().-]{5,}\d", text):
-                digits = re.sub(r"\D", "", phone)
-                if 8 <= len(digits) <= 15:
-                    phones.add(re.sub(r"\s+", " ", phone).strip())
-            if checked == 1:
-                queue.extend(contact_links(soup, response.url))
-            time.sleep(0.25)
-        except requests.RequestException as exc:
-            log(f"Website could not be checked: {url} — {str(exc)[:100]}")
-    preferred = sorted(emails, key=lambda e: (not any(x in e.split("@")[0] for x in
-                       ("info", "sales", "contact", "hello", "office", "enquiry", "support")), len(e)))
-    row["Email"] = preferred[0] if preferred else ""
-    row["Phone"] = sorted(phones, key=len)[0] if phones else ""
-    row["Business Description"] = description
-    row["Status"] = f"Checked {checked} page(s); " + ("public contact found" if row["Email"] or row["Phone"] else "no public phone/email found")
-    return row
 
-def make_excel(rows, query, area):
-    frame = pd.DataFrame(rows, columns=["Business Name", "Website", "Phone", "Email", "Business Description", "Source URL", "Status"])
-    summary = pd.DataFrame([{"Field": "Query", "Value": query},
-                            {"Field": "Area", "Value": area},
-                            {"Field": "Companies researched", "Value": len(rows)},
-                            {"Field": "Important note", "Value": "Search results may include directories. Verify sources before outreach."}])
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        frame.to_excel(writer, index=False, sheet_name="Leads")
-        summary.to_excel(writer, index=False, sheet_name="Search Summary")
-        ws = writer.sheets["Leads"]
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for col, width in {"A":34,"B":38,"C":22,"D":34,"E":65,"F":42,"G":42}.items():
-            ws.column_dimensions[col].width = width
-    buffer.seek(0)
-    return buffer.getvalue()
+        visited.add(page_url)
+        contact_html, resolved_url = fetch(page_url)
+
+        if not contact_html or get_host(resolved_url) != host:
+            continue
+
+        page_emails, page_phones, _ = get_contacts(contact_html)
+        emails.extend(page_emails)
+        phones.extend(page_phones)
+
+        if emails and phones:
+            break
+
+        time.sleep(0.15)
+
+    return {
+        "Business Name": name,
+        "Website": final_url,
+        "Phone": next(iter(dict.fromkeys(phones)), ""),
+        "Email": next(iter(dict.fromkeys(emails)), ""),
+        "Business Description": description[:500],
+        "Location Searched": area,
+        "Search Query": query,
+        "Source URL": final_url,
+        "Contact Source URL": final_url if emails or phones else ""
+    }
+
+
+with st.form("lead_search"):
+    query = st.text_input(
+        "Business / industry",
+        placeholder="e.g. Real estate agencies"
+    )
+    area = st.text_input(
+        "Country / city / area (optional)",
+        placeholder="e.g. Karachi, Pakistan"
+    )
+    target = st.select_slider(
+        "Companies to find",
+        options=[10, 20, 50, 100],
+        value=100
+    )
+    submitted = st.form_submit_button(
+        "Start search and website research",
+        type="primary"
+    )
 
 if submitted:
     if not query.strip():
-        st.error("Please enter a business or industry query.")
-    else:
-        log_area = st.empty()
-        log_lines = []
-        def log(message):
-            log_lines.append(message)
-            log_area.code("\n".join(log_lines[-18:]))
-        try:
-            with st.spinner("Searching public web results..."):
-                candidates = discover(query.strip(), area.strip(), int(target), log)
-            st.write(f"Discovered **{len(candidates)} candidate websites**. Now checking each website.")
-            results = []
-            progress = st.progress(0)
-            status = st.empty()
-            for index, candidate in enumerate(candidates, 1):
-                status.write(f"Researching {index}/{len(candidates)}: {candidate['Website']}")
-                results.append(research(candidate, log))
-                progress.progress(index / max(1, len(candidates)))
-                st.session_state["fresh_leads_rows"] = results.copy()
-            st.session_state["fresh_leads_query"] = query.strip()
-            st.session_state["fresh_leads_area"] = area.strip()
-            st.success(f"Finished: researched {len(results)} companies. The target is not guaranteed.")
-        except Exception as exc:
-            st.error(f"Search stopped: {type(exc).__name__}: {exc}")
-            if "fresh_leads_rows" in st.session_state:
-                st.warning("Partial results are available below if any were collected.")
+        st.warning("Please enter a business or industry.")
+        st.stop()
 
-if "fresh_leads_rows" in st.session_state and st.session_state["fresh_leads_rows"]:
-    rows = st.session_state["fresh_leads_rows"]
-    st.subheader(f"Results ({len(rows)})")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    data = make_excel(rows, st.session_state.get("fresh_leads_query", ""),
-                      st.session_state.get("fresh_leads_area", ""))
-    st.download_button("Download Excel workbook (.xlsx)", data=data, file_name="fresh_leads.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    log = st.container()
+    progress = st.progress(0)
+
+    with st.spinner("Searching for candidate company websites..."):
+        candidates = discover(query.strip(), area.strip(), int(target), log)
+
+    if not candidates:
+        st.warning(
+            "No suitable websites found. Try a different query or location."
+        )
+        st.stop()
+
+    st.write(f"Candidate websites found: {len(candidates)}")
+
+    rows = []
+    seen = set()
+
+    for index, candidate in enumerate(candidates):
+        if len(rows) >= target:
+            break
+
+        try:
+            row = research_site(candidate, query.strip(), area.strip())
+
+            if row:
+                host = get_host(row["Website"])
+                if host not in seen:
+                    seen.add(host)
+                    rows.append(row)
+                    log.write(
+                        f"Accepted {len(rows)}/{target}: "
+                        f"{row['Business Name']} — {row['Website']}"
+                    )
+        except Exception as exc:
+            log.write(f"Skipped one website: {type(exc).__name__}")
+
+        progress.progress((index + 1) / len(candidates))
+        time.sleep(0.2)
+
+    if not rows:
+        st.warning(
+            "No websites passed the filters. Try a broader query or another area."
+        )
+        st.stop()
+
+    df = pd.DataFrame(rows)
+
+    st.success(
+        f"Finished: {len(df)} websites passed the filters. "
+        "The requested number is a target, not a guarantee."
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    excel = BytesIO()
+
+    with pd.ExcelWriter(excel, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Company Leads")
+        pd.DataFrame([{
+            "Query": query.strip(),
+            "Area": area.strip(),
+            "Requested": int(target),
+            "Found": len(df),
+            "Note": (
+                "Review each source URL. Contact details are taken from "
+                "the candidate website's own pages only."
+            )
+        }]).to_excel(writer, index=False, sheet_name="Search Summary")
+
+    st.download_button(
+        "Download Excel workbook (.xlsx)",
+        data=excel.getvalue(),
+        file_name="fresh_lead_finder_results.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        )
+    )
